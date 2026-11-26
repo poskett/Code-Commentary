@@ -1,0 +1,457 @@
+// ### Code Commentary
+// All commentary below was written manually by [James Poskett](https://warwick.ac.uk/fac/arts/history/people/staff_index/poskett/) (University of Warwick).
+//
+// This commentary is for [v1.1.1](https://github.com/poskett/Slow-Reading-OCR/releases/tag/v1.1.1).
+//
+// ### Overview
+// This script defines all the functions for saving the output of the run to a file. That includes either plain text or Markdown as well as the manifest.csv. It also makes sure we don't overwrite files that weren't created by the app.
+//
+// ### Import Libraries
+// Here we just need CryptoKit for hashing and Foundation for basic read/write and file handling.
+
+import CryptoKit
+import Foundation
+
+// ### Variables
+// Define the basic variables, particularly an enum so we decide if a text, markdown, jsonl, manifest, or list of pages.
+public enum OutputFormat: String, CaseIterable, Codable, Sendable {
+    case markdown
+    case text
+    case pages
+    case jsonl
+    case manifest
+}
+
+// The location of exported files.
+public struct ExportedFiles: Sendable {
+    public var files: [URL]
+}
+
+// ### Functions
+// This function defines a page marker in the form of <!-- p. --!>
+// It also some information about blank pages and pages that need checking.
+func pageMarker(_ result: PageResult, label: String) -> String {
+    var marker = "<!-- p. \(result.page)"
+    if label != "\(result.page)" {
+        marker += ", \(label)"
+    }
+    if result.response.naturalText == nil {
+        marker += ", blank"
+    }
+    if result.needsChecking {
+        marker += ", NEEDS CHECKING: \(result.problem ?? "uncertain result")"
+    }
+    return marker + " -->"
+}
+
+// This creates a markdown document of all the pages together, with the markers appended, and a double new line separator.
+public func markdownDocument(_ results: [PageResult], source: PageSource) -> String {
+    results.map { result in
+        let marker = pageMarker(result, label: source.pageLabel(result.page))
+        guard let text = result.response.naturalText else {
+            return marker
+        }
+        return marker + "\n\n" + text
+    }.joined(separator: "\n\n") + "\n"
+}
+
+// If we just want plain text, this strips most of the Markdown.
+public func plainText(fromMarkdown markdown: String) -> String {
+    var text = markdown
+    let replacements: [(String, String)] = [
+        (#"!\[([^\]]*)\]\([^)]*\)"#, "[Figure: $1]"),
+        (#"\[([^\]]+)\]\([^)]*\)"#, "$1"),
+        (#"(?m)^#{1,6}\s+"#, ""),
+        (#"\*\*([^*]+)\*\*"#, "$1"),
+        (#"(?<![\w*])\*([^*\n]+)\*(?![\w*])"#, "$1"),
+        (#"(?<![\w_])_([^_\n]+)_(?![\w_])"#, "$1"),
+        (#"(?m)^>\s?"#, ""),
+        (#"</?(?:table|thead|tbody|tr)[^>]*>"#, "\n"),
+        (#"</t[hd]>"#, "\t"),
+        (#"<[^>]+>"#, ""),
+        (#"\n{3,}"#, "\n\n"),
+    ]
+    for (pattern, template) in replacements {
+        text = text.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+    }
+    return text
+}
+
+// This creates a plain text document of all the pages together, stripping the markdown and adding a page number header plus a double line break.
+public func plainTextDocument(_ results: [PageResult], source: PageSource) -> String {
+    results.map { result in
+        var header = "[p. \(result.page)"
+        if source.kind == .folder {
+            header += ", \(source.pageLabel(result.page))"
+        }
+        if result.needsChecking {
+            header += ", NEEDS CHECKING"
+        }
+        header += "]"
+        return header + "\n\n" + plainText(fromMarkdown: result.response.naturalText ?? "")
+    }.joined(separator: "\n\n") + "\n"
+}
+
+// [Dolma](https://allenai.github.io/dolma/) is a toolkit developed by Allen AI, the creators of olmOCR2. This function puts the output of the OCR into the exact same format as dolma in order to make it easier to use dolma toolkit functions.
+public func dolmaRecord(_ results: [PageResult], run: DocumentRun) -> [String: Any]? {
+    var documentText = ""
+    var spans: [[Int]] = []
+    for (index, result) in results.enumerated() {
+        let start = documentText.unicodeScalars.count
+        if let text = result.response.naturalText {
+            documentText += text + (index < results.count - 1 ? "\n" : "")
+        }
+        spans.append([start, documentText.unicodeScalars.count, result.page])
+    }
+    guard !documentText.isEmpty else {
+        return nil
+    }
+    let day = ISO8601DateFormatter.string(from: run.finished, timeZone: .current, formatOptions: [.withFullDate])
+    let id = Insecure.SHA1.hash(data: Data(documentText.utf8)).map { String(format: "%02x", $0) }.joined()
+    func list<T>(_ value: (PageResult) -> T) -> [Any] { results.map { value($0) as Any } }
+    return [
+        "id": id,
+        "text": documentText,
+        "source": "olmocr",
+        "added": day,
+        "created": day,
+        "metadata": [
+            "Source-File": run.source,
+            "olmocr-version": "olmocr-mac \(run.appVersion)",
+            "pdf-total-pages": results.count,
+            "total-input-tokens": run.totalInputTokens,
+            "total-output-tokens": run.totalOutputTokens,
+            "total-fallback-pages": run.fallbackPages.count,
+            "model": run.model,
+        ],
+        "attributes": [
+            "pdf_page_numbers": spans,
+            "primary_language": results.map { ($0.response.primaryLanguage as Any?) ?? NSNull() },
+            "is_rotation_valid": list { $0.response.isRotationValid },
+            "rotation_correction": list { $0.response.rotationCorrection },
+            "is_table": list { $0.response.isTable },
+            "is_diagram": list { $0.response.isDiagram },
+            "needs_checking": list { $0.needsChecking },
+        ],
+    ]
+}
+
+// This defines where the outputs are stored.
+public func outputBaseURL(for source: PageSource, outputFolder: URL?) -> URL {
+    let folder = outputFolder ?? source.url.deletingLastPathComponent()
+    let name = source.kind == .folder ? source.url.lastPathComponent : source.url.deletingPathExtension().lastPathComponent
+    return folder.appendingPathComponent(name)
+}
+
+// A variable to hold everything for the outputs.
+public struct OutputPlan: Codable, Sendable {
+    public var base: URL
+    public var folder: URL
+    public var manifest: URL
+    public var formats: [OutputFormat]
+    public var model: String
+    public var modelRevision: String?
+}
+
+// This defines the above variable, so we know where the outputs are going and in what format, with what model and alike.
+public func makeOutputPlan(
+    source: PageSource, outputFolder: URL?, formats: [OutputFormat], model: String, modelRevision: String?
+) -> OutputPlan {
+    let placement = availableBase(for: source, outputFolder: outputFolder)
+    let base = transcriptBase(placement)
+    return OutputPlan(
+        base: base,
+        folder: transcriptFolder(placement),
+        manifest: manifestURL(base),
+        formats: formats,
+        model: model,
+        modelRevision: modelRevision
+    )
+}
+
+// Define the appropriate file extensions for plain text and Markdown (default).
+func pageFileExtensions(_ formats: [OutputFormat]) -> [String] {
+    var extensions: [String] = []
+    if formats.contains(.markdown) {
+        extensions.append("md")
+    }
+    if formats.contains(.text) {
+        extensions.append("txt")
+    }
+    return extensions.isEmpty ? ["md"] : extensions
+}
+
+// For individual page files, define the file name and location.
+public func pageFileURL(page: Int, source: PageSource, plan: OutputPlan, fileExtension: String? = nil) -> URL {
+    var stem: String
+    if source.kind == .folder {
+        stem = source.pageStems[page - 1]
+    } else {
+        stem = String(format: "p%04d", page)
+    }
+    if stem.lowercased() == plan.base.lastPathComponent.lowercased() {
+        stem += "_page"
+    }
+    let ext = fileExtension ?? pageFileExtensions(plan.formats)[0]
+    return plan.folder.appendingPathComponent(stem).appendingPathExtension(ext)
+}
+
+// ### File Output
+// The important bit! Write the actual file to the folder. Otherwise, we have nothing saved.
+public func writePageFile(_ result: PageResult, source: PageSource, plan: OutputPlan, onlyIfMissing: Bool = false) throws {
+    guard plan.formats.contains(.pages) else {
+        return
+    }
+    let manager = FileManager.default
+    try prepareTranscriptFolder(plan, source: source)
+    for ext in pageFileExtensions(plan.formats) {
+        let url = pageFileURL(page: result.page, source: source, plan: plan, fileExtension: ext)
+        if onlyIfMissing && manager.fileExists(atPath: url.path) {
+            continue
+        }
+        let text = result.response.naturalText ?? ""
+        let content = ext == "txt" ? plainText(fromMarkdown: text) : text
+        try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+// ### Status and Manifest
+// A simple hash to make sure the prompt is exact.
+public let promptHash: String = {
+    let digest = SHA256.hash(data: Data(olmOCRPrompt.utf8)).map { String(format: "%02x", $0) }.joined()
+    return String(digest.prefix(10))
+}()
+
+// Take some text, and make it fit in a single .csv cell. This is so we can fill in the manifest properly.
+func csvField(_ value: String) -> String {
+    if value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r") {
+        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+    return value
+}
+
+// A simple function to define how the page went. Was it ok, or did it fail in some way?
+func pageStatus(_ result: PageResult) -> String {
+    if result.isFallback && result.response.naturalText == nil {
+        return "failed"
+    }
+    if result.isFallback {
+        return "fallback"
+    }
+    if result.needsChecking {
+        return "check"
+    }
+    if result.response.naturalText == nil {
+        return "blank"
+    }
+    return "ok"
+}
+
+// Define the columns for the .csv manifest.
+let manifestColumns = [
+    "source_file", "page", "page_label", "image_path", "page_file", "model", "model_revision",
+    "prompt_version", "prompt_hash", "options", "status", "problem", "language", "is_table", "is_diagram",
+    "rotation", "attempts", "temperature", "chars", "input_tokens", "output_tokens", "seconds", "timestamp",
+]
+
+// This is the main function that defines the manifest and fills it in with all the details of each page in the run.
+public func manifestCSV(_ results: [PageResult], source: PageSource, plan: OutputPlan) -> String {
+    let temperatures = temperatureByAttempt.map { String($0) }.joined(separator: ", ")
+    func optionsText(_ result: PageResult) -> String {
+        let limit = result.tokenLimit ?? maxTokens
+        let repetition = (result.stopOnRepetition ?? false) ? "true" : "false"
+        return "{\"image_longest_side\": \(Int(targetLongestSide)), \"max_tokens\": \(limit), \"stop_on_repetition\": \(repetition), \"temperature_by_attempt\": [\(temperatures)]}"
+    }
+    let timestampFormatter = ISO8601DateFormatter()
+    timestampFormatter.formatOptions = [.withInternetDateTime]
+    timestampFormatter.timeZone = .current
+
+    var lines = [manifestColumns.joined(separator: ",")]
+    for result in results.sorted(by: { $0.page < $1.page }) {
+        let pageFile = plan.formats.contains(.pages) ? pageFileURL(page: result.page, source: source, plan: plan).path : ""
+        let imagePath = source.kind == .folder ? source.imageFiles[result.page - 1].path : ""
+        let row: [String] = [
+            source.url.lastPathComponent,
+            "\(result.page)",
+            source.pageLabel(result.page),
+            imagePath,
+            pageFile,
+            plan.model,
+            plan.modelRevision ?? "",
+            promptVersion,
+            promptHash,
+            optionsText(result),
+            pageStatus(result),
+            result.problem ?? "",
+            result.response.primaryLanguage ?? "",
+            result.response.isTable ? "true" : "false",
+            result.response.isDiagram ? "true" : "false",
+            "\(result.rotation)",
+            "\(result.attempts)",
+            String(format: "%.1f", result.temperature),
+            "\(result.response.naturalText?.count ?? 0)",
+            "\(result.inputTokens)",
+            "\(result.outputTokens)",
+            String(format: "%.1f", result.seconds),
+            result.finishedAt.map { timestampFormatter.string(from: $0) } ?? "",
+        ]
+        lines.append(row.map(csvField).joined(separator: ","))
+    }
+    return lines.joined(separator: "\n") + "\n"
+}
+
+// And this is the function that actually writes the manifest to disk.
+public func writeManifest(_ results: [PageResult], source: PageSource, plan: OutputPlan) throws {
+    guard plan.formats.contains(.manifest) else {
+        return
+    }
+    try prepareTranscriptFolder(plan, source: source)
+    try manifestCSV(results, source: source, plan: plan).write(to: plan.manifest, atomically: true, encoding: .utf8)
+    markAsOutput(plan.manifest, source: source)
+}
+
+// ### Save Everything
+// This function brings everything together, writing all the outputs (pages, whole documents, and manifests) to disk. It also makes sure that each file type has the right extension.
+public func writeOutputs(results: [PageResult], run: DocumentRun, source: PageSource, plan: OutputPlan) throws
+    -> ExportedFiles
+{
+    let base = plan.base
+    try prepareTranscriptFolder(plan, source: source)
+    var written: [URL] = []
+
+    for format in plan.formats {
+        switch format {
+        case .markdown:
+            let url = base.appendingPathExtension("md")
+            try markdownDocument(results, source: source).write(to: url, atomically: true, encoding: .utf8)
+            markAsOutput(url, source: source)
+            written.append(url)
+        case .text:
+            let url = base.appendingPathExtension("txt")
+            try plainTextDocument(results, source: source).write(to: url, atomically: true, encoding: .utf8)
+            markAsOutput(url, source: source)
+            written.append(url)
+        case .pages:
+            for result in results {
+                try writePageFile(result, source: source, plan: plan)
+            }
+            written.append(plan.folder)
+        case .jsonl:
+            let url = base.appendingPathExtension("jsonl")
+            if let record = dolmaRecord(results, run: run) {
+                let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys, .withoutEscapingSlashes])
+                try (String(data: data, encoding: .utf8)! + "\n").write(to: url, atomically: true, encoding: .utf8)
+                markAsOutput(url, source: source)
+                written.append(url)
+            }
+        case .manifest:
+            try writeManifest(results, source: source, plan: plan)
+            written.append(plan.manifest)
+        }
+    }
+    return ExportedFiles(files: written)
+}
+
+// ### Protection
+// The following code is designed to make sure the app doesn't overwrite other documents that were not created by it. For example, if you have your own transcriptions in the same folder, or alike.
+
+// This defines a unique marker that goes in the metadata of each output. That way, we can check if a file was created by Slow Reading OCR.
+let outputMarker = "io.github.poskett.slowreading.output"
+
+// This is the file path, which we use with the output marker to get a unique key.
+func sourceKey(_ source: PageSource) -> String {
+    source.url.standardizedFileURL.path
+}
+
+// Decide if the file is an output created by the app (by using the above source key and metadata marker).
+public func isOutput(_ url: URL, of source: PageSource) -> Bool {
+    let size = getxattr(url.path, outputMarker, nil, 0, 0, 0)
+    guard size > 0 else {
+        return false
+    }
+    var buffer = [UInt8](repeating: 0, count: size)
+    getxattr(url.path, outputMarker, &buffer, size, 0, 0)
+    return String(decoding: buffer, as: UTF8.self) == sourceKey(source)
+}
+
+// This function uses the marker and source key to actually write output in such a way that identifies it later.
+func markAsOutput(_ url: URL, source: PageSource) {
+    let value = Array(sourceKey(source).utf8)
+    setxattr(url.path, outputMarker, value, value.count, 0, 0)
+}
+// Return the folder with the transcripts in.
+func transcriptFolder(_ placement: URL) -> URL {
+    URL(fileURLWithPath: placement.path + "_transcript", isDirectory: true)
+}
+
+// Return the file path to the file in the above folder.
+func transcriptBase(_ placement: URL) -> URL {
+    transcriptFolder(placement).appendingPathComponent(placement.lastPathComponent)
+}
+
+// Return the file path for the manifest
+func manifestURL(_ base: URL) -> URL {
+    URL(fileURLWithPath: base.path + "_manifest.csv")
+}
+// Return the file paths for the outputs
+func wholeDocumentFiles(_ base: URL) -> [URL] {
+    ["md", "txt", "jsonl"].map { base.appendingPathExtension($0) }
+}
+
+// If already have the same name, then we need to append a number, so this prepares that.
+func numberedPlacement(_ first: URL, number: Int) -> URL {
+    number == 1
+        ? first
+        : first.deletingLastPathComponent().appendingPathComponent("\(first.lastPathComponent) (\(number))")
+}
+
+// Find the folder or create it if it doesn't exist.
+func prepareTranscriptFolder(_ plan: OutputPlan, source: PageSource) throws {
+    guard !FileManager.default.fileExists(atPath: plan.folder.path) else {
+        return
+    }
+    try FileManager.default.createDirectory(at: plan.folder, withIntermediateDirectories: true)
+    markAsOutput(plan.folder, source: source)
+}
+
+func outputCandidates(_ placement: URL) -> [URL] {
+    let base = transcriptBase(placement)
+    return [transcriptFolder(placement), manifestURL(base)] + wholeDocumentFiles(base)
+}
+
+// This is the actual function which checks for and returns any previous transcriptions created by the app.
+public func existingTranscripts(for source: PageSource, outputFolder: URL?) -> [URL] {
+    let manager = FileManager.default
+    let first = outputBaseURL(for: source, outputFolder: outputFolder)
+    var found = wholeDocumentFiles(first).filter { isOutput($0, of: source) }
+    var number = 1
+    while true {
+        let placement = numberedPlacement(first, number: number)
+        let folder = transcriptFolder(placement)
+        guard manager.fileExists(atPath: folder.path) else {
+            return found
+        }
+        if isOutput(folder, of: source) {
+            let files = wholeDocumentFiles(transcriptBase(placement)).filter { manager.fileExists(atPath: $0.path) }
+            found.insert(contentsOf: files, at: 0)
+        }
+        number += 1
+    }
+}
+
+// This checks whether we can use that filename, and if already uses, adds a (2), (3), (4) and so on after it to avoid a clash.
+public func availableBase(for source: PageSource, outputFolder: URL?) -> URL {
+    let first = outputBaseURL(for: source, outputFolder: outputFolder)
+    let manager = FileManager.default
+    var number = 1
+    while true {
+        let placement = numberedPlacement(first, number: number)
+        let free = outputCandidates(placement).allSatisfy { url in
+            !manager.fileExists(atPath: url.path) || isOutput(url, of: source)
+        }
+        if free {
+            return placement
+        }
+        number += 1
+    }
+}
